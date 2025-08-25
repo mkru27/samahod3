@@ -1,7 +1,7 @@
 import os
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -18,12 +18,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # ===================== SIMPLE, INLINE-FIRST MVP =====================
-# Особенности для аудитории «50+»:
-# • Все действия через понятные ИНЛАЙН-кнопки.
-# • Дата — выбор из ближайших дней + «Сегодня/Завтра», время — 3 слота.
-# • Адрес — текстом (улица, дом). Геометку можно прислать «скрепкой», но это необязательно.
-# • «Позвонить» — карточка контакта; «Оставить номер» — написать цифрами.
-# • Короткие сообщения.
+# • Все действия через ИНЛАЙН-кнопки.
+# • Дата — Сегодня/Завтра/ближайшие 7 дней, время — 09:00/13:00/18:00 или ввод 10:30.
+# • Адрес — текстом (улица, дом). Геометка необязательна.
+# • «Связаться» — отправляем карточку контакта диспетчера и принимаем номер текстом.
 
 # --------------------- Config & Globals ---------------------
 load_dotenv()
@@ -79,11 +77,9 @@ USERS: Dict[int, User] = {}
 ORDERS: Dict[int, Order] = {}
 MATCHES: Dict[int, Match] = {}
 ACTIVE_CHATS: Dict[int, Tuple[int, int]] = {}  # user_id -> (peer_id, order_id)
-
 LAST_PHONE_SHARE: Dict[int, datetime] = {}
 
 _order_seq = 1
-
 def next_order_id() -> int:
     global _order_seq
     i = _order_seq
@@ -111,8 +107,6 @@ async def ensure_user(m: Message) -> User:
     return u
 
 async def send_support_contacts(chat_id: int):
-    # Telegram не принимает inline-URL вида tel:+...
-    # Отправляем текст + карточку контакта (в клиентах есть кнопка «Позвонить»).
     text = "📞 Наш номер: {}\nЕсли хотите, просто напишите ваш номер ответным сообщением — мы перезвоним.".format(SUPPORT_PHONE)
     await bot.send_message(chat_id, text)
     try:
@@ -213,7 +207,21 @@ async def home_cb(c: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("role:"))
 async def pick_role(c: CallbackQuery):
     code = c.data.split(":")[1]
-    u = await ensure_user(c.message)
+
+    # ВАЖНО: создаём/обновляем пользователя по тому, КТО НАЖАЛ кнопку,
+    # а не по сообщению бота.
+    u = USERS.get(c.from_user.id)
+    if not u:
+        u = User(
+            user_id=c.from_user.id,
+            username=c.from_user.username,
+            full_name=c.from_user.full_name or c.from_user.first_name or "Пользователь"
+        )
+        USERS[c.from_user.id] = u
+    else:
+        u.username = c.from_user.username
+        u.full_name = c.from_user.full_name or u.full_name
+
     if code == "c":
         u.role = "customer"
     elif code == "e":
@@ -223,6 +231,7 @@ async def pick_role(c: CallbackQuery):
             await c.answer("Только для утверждённых аккаунтов", show_alert=True)
             return
         u.role = "dispatcher"
+
     await c.answer("Роль сохранена")
     await show_menu(c.from_user.id)
 
