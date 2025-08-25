@@ -606,7 +606,7 @@ async def d_open(c: CallbackQuery):
     if not is_dispatcher(c.from_user.id):
         await c.answer("Нет доступа", show_alert=True)
         return
-    opens = [o for o in ORDERS.values() if o.status == "open")]
+    opens = [o for o in ORDERS.values() if o.status == "open"]
     if not opens:
         await c.message.answer("Открытых заказов нет.")
     else:
