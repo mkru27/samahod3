@@ -1,7 +1,7 @@
 import os
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -18,11 +18,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 # ===================== SIMPLE, INLINE-FIRST MVP =====================
-# • Все действия через ИНЛАЙН-кнопки.
-# • Дата — Сегодня/Завтра/ближайшие 7 дней, время — 09:00/13:00/18:00 или ввод 10:30.
-# • Адрес — текстом (улица, дом). Геометка необязательна.
-# • «Связаться» — показываем только текст с номером; пользователь может отправить свой номер текстом.
-# • Перехват номера: если человек просто написал телефон (7+ цифр) вне шагов — считаем это «оставить номер».
+# • Инлайн-кнопки, простой выбор даты/времени.
+# • «Связаться» — текст с номером. Можно просто написать свой номер.
+# • Логи звонков: сохраняем и показываем диспетчеру с отметкой "обработано".
 # ================================================================
 
 # --------------------- Config & Globals ---------------------
@@ -75,10 +73,24 @@ class Match:
     reveal_requested: Dict[int, bool] = field(default_factory=dict)
     reveal_approved_by_dispatcher: bool = False
 
+@dataclass
+class CallLog:
+    id: int
+    ts: datetime
+    from_user_id: int
+    from_name: str
+    phone: str
+    source: str  # "button" | "text"
+    status: str = "new"  # new|done
+
 USERS: Dict[int, User] = {}
 ORDERS: Dict[int, Order] = {}
 MATCHES: Dict[int, Match] = {}
 ACTIVE_CHATS: Dict[int, Tuple[int, int]] = {}  # user_id -> (peer_id, order_id)
+
+CALL_LOGS: Dict[int, CallLog] = {}
+_call_log_seq = 1
+
 LAST_PHONE_SHARE: Dict[int, datetime] = {}
 
 _order_seq = 1
@@ -86,6 +98,12 @@ def next_order_id() -> int:
     global _order_seq
     i = _order_seq
     _order_seq += 1
+    return i
+
+def next_call_log_id() -> int:
+    global _call_log_seq
+    i = _call_log_seq
+    _call_log_seq += 1
     return i
 
 # --------------------- Helpers ---------------------
@@ -109,9 +127,72 @@ async def ensure_user(m: Message) -> User:
     return u
 
 async def send_support_contacts(chat_id: int):
-    # Только текст с номером (без contact-card и без tel: URL)
     text = "📞 Наш номер: {}\nЕсли хотите, просто напишите ваш номер ответным сообщением — мы перезвоним.".format(SUPPORT_PHONE)
     await bot.send_message(chat_id, text)
+
+async def notify_dispatchers(text: str, kb: Optional[InlineKeyboardMarkup] = None):
+    # Отправляем ВСЕМ из ADMIN_IDS (не важно, переключили ли они роль)
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb)
+        except Exception:
+            pass
+    # И тем, кто явно в роли диспетчера (на случай, если ADMIN_IDS пуст)
+    for u in USERS.values():
+        if u.role == "dispatcher" and is_dispatcher(u.user_id):
+            try:
+                await bot.send_message(u.user_id, text, reply_markup=kb)
+            except Exception:
+                pass
+
+def add_call_log(user: User, phone: str, source: str) -> CallLog:
+    log = CallLog(
+        id=next_call_log_id(),
+        ts=datetime.utcnow(),
+        from_user_id=user.user_id,
+        from_name=user.full_name or str(user.user_id),
+        phone=phone,
+        source=source,
+        status="new"
+    )
+    CALL_LOGS[log.id] = log
+    return log
+
+# --------------------- States ---------------------
+
+class CreateOrder(StatesGroup):
+    waiting_desc = State()
+    waiting_day = State()
+    waiting_time = State()
+    waiting_address = State()
+    collecting_docs = State()
+
+class ExecBid(StatesGroup):
+    waiting_price = State()
+
+class SharePhone(StatesGroup):
+    waiting_phone_text = State()
+
+class Availability(StatesGroup):
+    waiting_text = State()
+
+# --------------------- Start & Role ---------------------
+
+@dp.message(CommandStart())
+async def start(m: Message):
+    u = await ensure_user(m)
+    if u.role == "dispatcher" and not is_dispatcher(u.user_id):
+        u.role = None
+    await bot.send_message(m.chat.id, "Привет! Я помогу быстро найти исполнителя для стройработ. Всё просто, по шагам.")
+    await show_menu(m.from_user.id)
+
+@dp.message(Command("menu"))
+async def menu_cmd(m: Message):
+    await show_menu(m.from_user.id)
+
+@dp.message(Command("contacts"))
+async def contacts_cmd(m: Message):
+    await send_support_contacts(m.chat.id)
 
 async def show_menu(uid: int):
     u = USERS.get(uid)
@@ -152,49 +233,7 @@ async def show_menu(uid: int):
         ])
         await bot.send_message(uid, "Панель диспетчера:", reply_markup=kb)
 
-async def broadcast_to_dispatchers(text: str, kb: Optional[InlineKeyboardMarkup] = None):
-    for u in USERS.values():
-        if u.role == "dispatcher" and is_dispatcher(u.user_id):
-            try:
-                await bot.send_message(u.user_id, text, reply_markup=kb)
-            except Exception:
-                pass
-
-# --------------------- States ---------------------
-
-class CreateOrder(StatesGroup):
-    waiting_desc = State()
-    waiting_day = State()
-    waiting_time = State()
-    waiting_address = State()
-    collecting_docs = State()
-
-class ExecBid(StatesGroup):
-    waiting_price = State()
-
-class SharePhone(StatesGroup):
-    waiting_phone_text = State()
-
-class Availability(StatesGroup):
-    waiting_text = State()
-
-# --------------------- Start & Role ---------------------
-
-@dp.message(CommandStart())
-async def start(m: Message):
-    u = await ensure_user(m)
-    if u.role == "dispatcher" and not is_dispatcher(u.user_id):
-        u.role = None
-    await bot.send_message(m.chat.id, "Привет! Я помогу быстро найти исполнителя для стройработ. Всё просто, по шагам.")
-    await show_menu(m.from_user.id)
-
-@dp.message(Command("menu"))
-async def menu_cmd(m: Message):
-    await show_menu(m.from_user.id)
-
-@dp.message(Command("contacts"))
-async def contacts_cmd(m: Message):
-    await send_support_contacts(m.chat.id)
+# --------------------- Role switch ---------------------
 
 @dp.callback_query(F.data == "home")
 async def home_cb(c: CallbackQuery, state: FSMContext):
@@ -205,8 +244,6 @@ async def home_cb(c: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("role:"))
 async def pick_role(c: CallbackQuery):
     code = c.data.split(":", 1)[1]
-
-    # Создаём/обновляем пользователя по тому, КТО нажал кнопку.
     u = USERS.get(c.from_user.id)
     if not u:
         u = User(
@@ -232,7 +269,7 @@ async def pick_role(c: CallbackQuery):
     await c.answer("Роль сохранена")
     await show_menu(c.from_user.id)
 
-# --------------------- Customer: Create Order (INLINE) ---------------------
+# --------------------- Customer: Create Order ---------------------
 
 @dp.callback_query(F.data == "c:new")
 async def c_new(c: CallbackQuery, state: FSMContext):
@@ -274,14 +311,13 @@ async def c_day(c: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("ctime:"))
 async def c_time(c: CallbackQuery, state: FSMContext):
-    # FIX: берём всё после первого ":", чтобы сохранить "HH:MM"
-    val = c.data.split(":", 1)[1]
+    val = c.data.split(":", 1)[1]   # сохраняем "HH:MM"
     if val == "custom":
         await state.set_state(CreateOrder.waiting_time)
         await c.message.answer("Введите время в формате ЧЧ:ММ, например 10:30.")
         await c.answer()
         return
-    await state.update_data(time=val)  # здесь val вида "09:00"
+    await state.update_data(time=val)
     await ask_address(c.message, state)
     await c.answer()
 
@@ -353,7 +389,7 @@ async def c_finish(c: CallbackQuery):
     await c.message.answer("Заказ опубликован. Исполнители рядом увидят и пришлют цены.")
     await show_menu(c.from_user.id)
 
-# --------------------- Executor: Feed & Bids (INLINE) ---------------------
+# --------------------- Executor: Feed & Bids ---------------------
 
 @dp.callback_query(F.data == "e:feed")
 async def e_feed(c: CallbackQuery):
@@ -417,7 +453,7 @@ async def e_price(m: Message, state: FSMContext):
     except Exception:
         pass
 
-# --------------------- Customer: Offers & Choose (INLINE) ---------------------
+# --------------------- Customer: Offers & Choose ---------------------
 
 @dp.callback_query(F.data == "c:offers")
 async def c_offers(c: CallbackQuery):
@@ -492,7 +528,7 @@ async def cmd_reveal(m: Message):
         await bot.send_message(mt.executor_id, f"🔓 Контакты раскрыты: {mention(cu.user_id, cu.username, cu.full_name)}")
     else:
         await m.answer("Запрос принят. Раскроем контакты после согласия второй стороны или одобрения диспетчера.")
-        await broadcast_to_dispatchers(f"🔔 Запрос на раскрытие контактов по заказу #{oid}. Одобрить: /approve_reveal {oid}")
+        await notify_dispatchers(f"🔔 Запрос на раскрытие контактов по заказу #{oid}. Одобрить: /approve_reveal {oid}")
 
 @dp.message(Command("approve_reveal"))
 async def cmd_approve_reveal(m: Message):
@@ -540,60 +576,7 @@ async def cmd_end(m: Message):
     except Exception:
         pass
 
-# --------------------- PHONE FALLBACK (перехват цифр вне состояний/чатов) ---------------------
-
-@dp.message(F.text)
-async def fallback_catch_phone(m: Message, state: FSMContext):
-    # Не мешаем активным шагам или анонимным чатам
-    if await state.get_state() is not None:
-        return
-    if ACTIVE_CHATS.get(m.from_user.id):
-        return
-
-    digits = only_digits_phone(m.text or "")
-    if len(digits) >= 7:
-        now = datetime.utcnow()
-        last = LAST_PHONE_SHARE.get(m.from_user.id)
-        if last and (now - last).total_seconds() < PHONE_SHARE_RATE_LIMIT:
-            await m.answer("Мы недавно получили ваш номер. Скоро свяжемся. Спасибо!")
-            return
-        LAST_PHONE_SHARE[m.from_user.id] = now
-        u = USERS.get(m.from_user.id) or await ensure_user(m)
-        await broadcast_to_dispatchers(f"📞 Просьба перезвонить: {mention(u.user_id, u.username, u.full_name)} — {digits}")
-        await m.answer("Спасибо! Передал диспетчеру. Ожидайте звонка.")
-        return
-    # Иначе просто молчим, чтобы не мешать другим обработчикам
-
-# --------------------- Relay (анонимный чат) ---------------------
-
-@dp.message(F.content_type.in_({"photo", "document", "audio", "video", "voice", "video_note", "location", "sticker"}))
-async def relay_non_text(m: Message):
-    link = ACTIVE_CHATS.get(m.from_user.id)
-    if not link:
-        return
-    peer_id, _ = link
-    try:
-        await bot.copy_message(chat_id=peer_id, from_chat_id=m.chat.id, message_id=m.message_id)
-    except Exception:
-        await m.answer("Не удалось доставить сообщение")
-
-@dp.message(F.text)
-async def relay_text(m: Message):
-    link = ACTIVE_CHATS.get(m.from_user.id)
-    if not link:
-        return
-    peer_id, _ = link
-    try:
-        await bot.copy_message(chat_id=peer_id, from_chat_id=m.chat.id, message_id=m.message_id)
-    except Exception:
-        await m.answer("Не удалось доставить сообщение")
-
-# --------------------- Help / Call (INLINE) ---------------------
-
-@dp.callback_query(F.data == "help")
-async def help_cb(c: CallbackQuery):
-    await c.message.answer("Если запутались — нажмите ‘Связаться’. Мы перезвоним и всё подскажем.")
-    await call_cb(c)
+# --------------------- PHONE HANDLERS ---------------------
 
 @dp.callback_query(F.data.startswith("call:"))
 async def call_cb(c: CallbackQuery):
@@ -624,11 +607,69 @@ async def receive_phone_text(m: Message, state: FSMContext):
     else:
         LAST_PHONE_SHARE[m.from_user.id] = now
         u = USERS.get(m.from_user.id) or await ensure_user(m)
-        await broadcast_to_dispatchers(f"📞 Просьба перезвонить: {mention(u.user_id, u.username, u.full_name)} — {digits}")
+        log = add_call_log(u, digits, source="button")
+        await notify_dispatchers(
+            f"📞 Заявка #{log.id} на звонок: {log.phone}\nОт: {mention(u.user_id, u.username, u.full_name)}\nКогда: {log.ts.strftime('%d.%m %H:%M UTC')}",
+            kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📒 Логи звонков", callback_data="d:logs")]])
+        )
         await m.answer("Спасибо! Передал диспетчеру. Ожидайте звонка.")
     await state.clear()
 
-# --------------------- Dispatcher Tools (упрощённо) ---------------------
+# Перехват номера, если просто написали текстом вне шагов/чатов
+@dp.message(F.text)
+async def fallback_catch_phone(m: Message, state: FSMContext):
+    if await state.get_state() is not None:
+        return
+    if ACTIVE_CHATS.get(m.from_user.id):
+        return
+    digits = only_digits_phone(m.text or "")
+    if len(digits) >= 7:
+        now = datetime.utcnow()
+        last = LAST_PHONE_SHARE.get(m.from_user.id)
+        if last and (now - last).total_seconds() < PHONE_SHARE_RATE_LIMIT:
+            await m.answer("Мы недавно получили ваш номер. Скоро свяжемся. Спасибо!")
+            return
+        LAST_PHONE_SHARE[m.from_user.id] = now
+        u = USERS.get(m.from_user.id) or await ensure_user(m)
+        log = add_call_log(u, digits, source="text")
+        await notify_dispatchers(
+            f"📞 Заявка #{log.id} на звонок: {log.phone}\nОт: {mention(u.user_id, u.username, u.full_name)}\nКогда: {log.ts.strftime('%d.%m %H:%M UTC')}",
+            kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📒 Логи звонков", callback_data="d:logs")]])
+        )
+        await m.answer("Спасибо! Передал диспетчеру. Ожидайте звонка.")
+
+# --------------------- Relay (анонимный чат) ---------------------
+
+@dp.message(F.content_type.in_({"photo", "document", "audio", "video", "voice", "video_note", "location", "sticker"}))
+async def relay_non_text(m: Message):
+    link = ACTIVE_CHATS.get(m.from_user.id)
+    if not link:
+        return
+    peer_id, _ = link
+    try:
+        await bot.copy_message(chat_id=peer_id, from_chat_id=m.chat.id, message_id=m.message_id)
+    except Exception:
+        await m.answer("Не удалось доставить сообщение")
+
+@dp.message(F.text)
+async def relay_text(m: Message):
+    link = ACTIVE_CHATS.get(m.from_user.id)
+    if not link:
+        return
+    peer_id, _ = link
+    try:
+        await bot.copy_message(chat_id=peer_id, from_chat_id=m.chat.id, message_id=m.message_id)
+    except Exception:
+        await m.answer("Не удалось доставить сообщение")
+
+# --------------------- Help ---------------------
+
+@dp.callback_query(F.data == "help")
+async def help_cb(c: CallbackQuery):
+    await c.message.answer("Если запутались — нажмите ‘Связаться’. Мы перезвоним и всё подскажем.")
+    await call_cb(c)
+
+# --------------------- Dispatcher Tools ---------------------
 
 @dp.callback_query(F.data == "d:open")
 async def d_open(c: CallbackQuery):
@@ -672,22 +713,65 @@ async def d_logs(c: CallbackQuery):
     if not is_dispatcher(c.from_user.id):
         await c.answer("Нет доступа", show_alert=True)
         return
-    await c.message.answer("Логи звонков будут добавлены в следующем релизе (упрощено в этом MVP).")
+
+    # Показываем сначала "new", максимум 15 шт., каждую — отдельным сообщением с кнопкой "✅ Обработано"
+    new_logs = [l for l in CALL_LOGS.values() if l.status == "new"]
+    new_logs.sort(key=lambda x: x.ts, reverse=True)
+    if not new_logs:
+        done = [l for l in CALL_LOGS.values() if l.status == "done"]
+        done.sort(key=lambda x: x.ts, reverse=True)
+        if not done:
+            await c.message.answer("Пока нет заявок на звонок.")
+        else:
+            await c.message.answer("Обработанные заявки (последние 10):")
+            for l in done[:10]:
+                text = f"#{l.id} • {l.phone} • {l.ts.strftime('%d.%m %H:%M UTC')} • от {l.from_name} — обработано"
+                await c.message.answer(text)
+    else:
+        await c.message.answer("Новые заявки:")
+        for l in new_logs[:15]:
+            text = f"#{l.id} • {l.phone} • {l.ts.strftime('%d.%m %H:%M UTC')} • от {l.from_name}"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Обработано", callback_data=f"d:logdone:{l.id}")]
+            ])
+            await c.message.answer(text, reply_markup=kb)
     await c.answer()
+
+@dp.callback_query(F.data.startswith("d:logdone:"))
+async def d_logdone(c: CallbackQuery):
+    if not is_dispatcher(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        lid = int(c.data.split(":", 2)[2])
+    except Exception:
+        await c.answer("Неверный ID", show_alert=True)
+        return
+    log = CALL_LOGS.get(lid)
+    if not log:
+        await c.answer("Запись не найдена", show_alert=True)
+        return
+    log.status = "done"
+    new_text = f"#{log.id} • {log.phone} • {log.ts.strftime('%d.%m %H:%M UTC')} • от {log.from_name} — ✅ обработано"
+    try:
+        await c.message.edit_text(new_text)
+    except Exception:
+        await c.message.answer(new_text)
+    await c.answer("Отмечено")
 
 @dp.callback_query(F.data == "d:help")
 async def d_help(c: CallbackQuery):
     if not is_dispatcher(c.from_user.id):
         await c.answer("Нет доступа", show_alert=True)
         return
-    await c.message.answer("Команды: /approve_reveal <order_id>, /end — завершить чат. Для связи с пользователем используйте /contacts.")
+    await c.message.answer("Команды: /approve_reveal <order_id>, /end — завершить чат. Чтобы получать заявки на звонок — укажите ADMIN_IDS.")
     await c.answer()
 
 # --------------------- Entry ---------------------
 
 async def main():
     print("Bot is running (Inline-first)…")
-    # СБРОС ВЕБХУКА, чтобы убрать конфликт с любым прошлым webhook'ом
+    # Сброс webhook, чтобы не было конфликта с прошлым хостингом
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
