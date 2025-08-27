@@ -22,6 +22,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # • Дата — Сегодня/Завтра/ближайшие 7 дней, время — 09:00/13:00/18:00 или ввод 10:30.
 # • Адрес — текстом (улица, дом). Геометка необязательна.
 # • «Связаться» — показываем только текст с номером; пользователь может отправить свой номер текстом.
+# • Перехват номера: если человек просто написал телефон (7+ цифр) вне шагов — считаем это «оставить номер».
 # ================================================================
 
 # --------------------- Config & Globals ---------------------
@@ -364,7 +365,7 @@ async def e_feed(c: CallbackQuery):
         addr = o.address_text or "геометка"
         text = (
             f"📌 Заказ #{o.id}\n"
-            f"Дата: {o.when_dt.strftime('%d.%m %H:%M') if o.when_dt else '—'}\n"
+            f"Дата: {o.when_dt.strftime('%d.%м %H:%M') if o.when_dt else '—'}\n"
             f"Адрес: {addr}\n\n"
             f"{o.description}\n\n📎 Вложений: {o.attachments_count}"
         )
@@ -467,7 +468,7 @@ async def c_choose(c: CallbackQuery):
         pass
     await c.answer()
 
-# --------------------- Anonymous chat, reveal, end ---------------------
+# --------------------- Reveal / End ---------------------
 
 @dp.message(Command("reveal"))
 async def cmd_reveal(m: Message):
@@ -538,12 +539,51 @@ async def cmd_end(m: Message):
     except Exception:
         pass
 
-@dp.message(F.content_type.in_({"text", "photo", "document", "audio", "video", "voice", "video_note", "location", "sticker"}))
-async def relay(m: Message):
+# --------------------- PHONE FALLBACK (перехват цифр вне состояний/чатов) ---------------------
+
+@dp.message(F.text)
+async def fallback_catch_phone(m: Message, state: FSMContext):
+    # Не мешаем активным шагам или анонимным чатам
+    if await state.get_state() is not None:
+        return
+    if ACTIVE_CHATS.get(m.from_user.id):
+        return
+
+    digits = only_digits_phone(m.text or "")
+    if len(digits) >= 7:
+        now = datetime.utcnow()
+        last = LAST_PHONE_SHARE.get(m.from_user.id)
+        if last and (now - last).total_seconds() < PHONE_SHARE_RATE_LIMIT:
+            await m.answer("Мы недавно получили ваш номер. Скоро свяжемся. Спасибо!")
+            return
+        LAST_PHONE_SHARE[m.from_user.id] = now
+        u = USERS.get(m.from_user.id)
+        if not u:
+            u = await ensure_user(m)
+        await broadcast_to_dispatchers(f"📞 Просьба перезвонить: {mention(u.user_id, u.username, u.full_name)} — {digits}")
+        await m.answer("Спасибо! Передал диспетчеру. Ожидайте звонка.")
+        return
+    # Иначе просто молчим, чтобы не мешать другим обработчикам
+
+# --------------------- Relay (анонимный чат) ---------------------
+
+@dp.message(F.content_type.in_({"photo", "document", "audio", "video", "voice", "video_note", "location", "sticker"}))
+async def relay_non_text(m: Message):
     link = ACTIVE_CHATS.get(m.from_user.id)
     if not link:
         return
-    peer_id, oid = link
+    peer_id, _ = link
+    try:
+        await bot.copy_message(chat_id=peer_id, from_chat_id=m.chat.id, message_id=m.message_id)
+    except Exception:
+        await m.answer("Не удалось доставить сообщение")
+
+@dp.message(F.text)
+async def relay_text(m: Message):
+    link = ACTIVE_CHATS.get(m.from_user.id)
+    if not link:
+        return
+    peer_id, _ = link
     try:
         await bot.copy_message(chat_id=peer_id, from_chat_id=m.chat.id, message_id=m.message_id)
     except Exception:
@@ -584,7 +624,7 @@ async def receive_phone_text(m: Message, state: FSMContext):
         await m.answer("Мы недавно получили ваш номер. Скоро свяжемся. Спасибо!")
     else:
         LAST_PHONE_SHARE[m.from_user.id] = now
-        u = USERS.get(m.from_user.id)
+        u = USERS.get(m.from_user.id) or await ensure_user(m)
         await broadcast_to_dispatchers(f"📞 Просьба перезвонить: {mention(u.user_id, u.username, u.full_name)} — {digits}")
         await m.answer("Спасибо! Передал диспетчеру. Ожидайте звонка.")
     await state.clear()
