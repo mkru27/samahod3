@@ -204,7 +204,7 @@ async def home_cb(c: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("role:"))
 async def pick_role(c: CallbackQuery):
-    code = c.data.split(":")[1]
+    code = c.data.split(":", 1)[1]
 
     # Создаём/обновляем пользователя по тому, КТО нажал кнопку.
     u = USERS.get(c.from_user.id)
@@ -259,7 +259,7 @@ async def c_desc(m: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("cday:"))
 async def c_day(c: CallbackQuery, state: FSMContext):
-    day = c.data.split(":")[1]
+    day = c.data.split(":", 1)[1]
     await state.update_data(day=day)
     await state.set_state(CreateOrder.waiting_time)
     rows = [
@@ -274,13 +274,14 @@ async def c_day(c: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("ctime:"))
 async def c_time(c: CallbackQuery, state: FSMContext):
-    val = c.data.split(":")[1]
+    # FIX: берём всё после первого ":", чтобы сохранить "HH:MM"
+    val = c.data.split(":", 1)[1]
     if val == "custom":
         await state.set_state(CreateOrder.waiting_time)
         await c.message.answer("Введите время в формате ЧЧ:ММ, например 10:30.")
         await c.answer()
         return
-    await state.update_data(time=val)
+    await state.update_data(time=val)  # здесь val вида "09:00"
     await ask_address(c.message, state)
     await c.answer()
 
@@ -343,7 +344,7 @@ async def c_docs(m: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("cfinish:"))
 async def c_finish(c: CallbackQuery):
-    oid = int(c.data.split(":")[1])
+    oid = int(c.data.split(":", 1)[1])
     o = ORDERS.get(oid)
     if not o:
         await c.answer("Не нашёл заказ", show_alert=True)
@@ -365,7 +366,7 @@ async def e_feed(c: CallbackQuery):
         addr = o.address_text or "геометка"
         text = (
             f"📌 Заказ #{o.id}\n"
-            f"Дата: {o.when_dt.strftime('%d.%м %H:%M') if o.when_dt else '—'}\n"
+            f"Дата: {o.when_dt.strftime('%d.%m %H:%M') if o.when_dt else '—'}\n"
             f"Адрес: {addr}\n\n"
             f"{o.description}\n\n📎 Вложений: {o.attachments_count}"
         )
@@ -377,7 +378,7 @@ async def e_feed(c: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("ebid:"))
 async def e_bid(c: CallbackQuery, state: FSMContext):
-    oid = int(c.data.split(":")[1])
+    oid = int(c.data.split(":", 1)[1])
     o = ORDERS.get(oid)
     if not o or o.status != "open":
         await c.answer("Заказ недоступен", show_alert=True)
@@ -557,9 +558,7 @@ async def fallback_catch_phone(m: Message, state: FSMContext):
             await m.answer("Мы недавно получили ваш номер. Скоро свяжемся. Спасибо!")
             return
         LAST_PHONE_SHARE[m.from_user.id] = now
-        u = USERS.get(m.from_user.id)
-        if not u:
-            u = await ensure_user(m)
+        u = USERS.get(m.from_user.id) or await ensure_user(m)
         await broadcast_to_dispatchers(f"📞 Просьба перезвонить: {mention(u.user_id, u.username, u.full_name)} — {digits}")
         await m.answer("Спасибо! Передал диспетчеру. Ожидайте звонка.")
         return
@@ -629,21 +628,6 @@ async def receive_phone_text(m: Message, state: FSMContext):
         await m.answer("Спасибо! Передал диспетчеру. Ожидайте звонка.")
     await state.clear()
 
-# --------------------- Executor Availability ---------------------
-
-@dp.callback_query(F.data == "e:avail")
-async def e_avail(c: CallbackQuery, state: FSMContext):
-    await state.set_state(Availability.waiting_text)
-    await c.message.answer("Опишите вашу доступность (например: будни 9:00–18:00, ближайшая дата 02.09).")
-    await c.answer()
-
-@dp.message(Availability.waiting_text)
-async def save_avail(m: Message, state: FSMContext):
-    u = await ensure_user(m)
-    u.availability_text = (m.text or "").strip()
-    await state.clear()
-    await m.answer("Доступность сохранена.")
-
 # --------------------- Dispatcher Tools (упрощённо) ---------------------
 
 @dp.callback_query(F.data == "d:open")
@@ -703,6 +687,8 @@ async def d_help(c: CallbackQuery):
 
 async def main():
     print("Bot is running (Inline-first)…")
+    # СБРОС ВЕБХУКА, чтобы убрать конфликт с любым прошлым webhook'ом
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
